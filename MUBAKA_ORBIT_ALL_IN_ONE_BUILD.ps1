@@ -1,34 +1,115 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+function Write-BlockedReceipt {
+  param(
+    [string]$Reason,
+    [string]$RootPath,
+    [string]$ReceiptPath,
+    [hashtable]$Evidence
+  )
+  $payload = [ordered]@{
+    status = 'BLOCKED_REVIEW_REQUIRED'
+    reason = $Reason
+    root_path = $RootPath
+    utc = [DateTime]::UtcNow.ToString('o')
+    evidence = $Evidence
+    next_action = 'Review failure evidence and rerun after correction.'
+  }
+  $payload | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $ReceiptPath -Encoding UTF8
+  Write-Output 'BLOCKED_REVIEW_REQUIRED'
+  Write-Output (Get-Content -LiteralPath $ReceiptPath -Raw)
+  exit 1
+}
+
+function Assert-Path {
+  param(
+    [string]$Path,
+    [string]$Reason,
+    [string]$RootPath,
+    [string]$ReceiptPath,
+    [hashtable]$Evidence
+  )
+  if (-not (Test-Path -LiteralPath $Path)) {
+    $Evidence['missing_path'] = $Path
+    Write-BlockedReceipt -Reason $Reason -RootPath $RootPath -ReceiptPath $ReceiptPath -Evidence $Evidence
+  }
+}
+
+function Invoke-NativeChecked {
+  param(
+    [string]$FilePath,
+    [string[]]$Arguments,
+    [string]$Label,
+    [string]$RootPath,
+    [string]$ReceiptPath,
+    [hashtable]$Evidence,
+    [switch]$AllowFailure
+  )
+  if (-not (Get-Command $FilePath -ErrorAction SilentlyContinue)) {
+    if ($AllowFailure) {
+      $Evidence[$Label] = 'command_missing_allowed'
+      return
+    }
+    $Evidence[$Label] = 'command_missing'
+    Write-BlockedReceipt -Reason "Missing command for $Label" -RootPath $RootPath -ReceiptPath $ReceiptPath -Evidence $Evidence
+  }
+
+  & $FilePath @Arguments
+  $exit = $LASTEXITCODE
+  if ($null -eq $exit) { $exit = 0 }
+
+  if ($exit -ne 0 -and -not $AllowFailure) {
+    $Evidence[$Label] = "exit_$exit"
+    Write-BlockedReceipt -Reason "Native command failed for $Label" -RootPath $RootPath -ReceiptPath $ReceiptPath -Evidence $Evidence
+  }
+
+  if ($exit -ne 0 -and $AllowFailure) {
+    $Evidence[$Label] = "allowed_exit_$exit"
+    return
+  }
+
+  $Evidence[$Label] = 'ok'
+}
+
 $root = 'C:\MUBAKA\ORBIT_OS'
-$sealRoot = Join-Path $root '_MUBAKA_SEAL'
-$backupRoot = Join-Path $sealRoot 'backup'
+$receiptPath = Join-Path $root 'FINAL_RECEIPT.json'
+$evidence = @{}
+
+$repoRoot = (Resolve-Path '.').Path
+$expectedPublic = Join-Path $repoRoot 'public'
+$expectedNetlify = Join-Path $repoRoot 'netlify.toml'
+
+foreach ($dir in @(
+  $root,
+  (Join-Path $root '_MUBAKA_SEAL'),
+  (Join-Path $root '_MUBAKA_SEAL\backup'),
+  (Join-Path $root '_TRAVEL'),
+  (Join-Path $root 'logs'),
+  (Join-Path $root 'data'),
+  (Join-Path $root 'ui'),
+  (Join-Path $root 'src'),
+  (Join-Path $root 'bin')
+)) {
+  New-Item -ItemType Directory -Path $dir -Force | Out-Null
+}
+
+$backupRoot = Join-Path $root '_MUBAKA_SEAL\backup'
 $travelRoot = Join-Path $root '_TRAVEL'
-$logsRoot = Join-Path $root 'logs'
 $dataRoot = Join-Path $root 'data'
-$uiRoot = Join-Path $root 'ui'
 $srcRoot = Join-Path $root 'src'
 $binRoot = Join-Path $root 'bin'
-
-$desktop = [Environment]::GetFolderPath('Desktop')
-$programs = [Environment]::GetFolderPath('Programs')
-$startup = [Environment]::GetFolderPath('Startup')
-$startMenuDir = Join-Path $programs 'MUBAKA ORBIT OS'
-$desktopRealExe = Join-Path $desktop 'MUBAKA ORBIT OS.exe'
-$desktopLink = Join-Path $desktop 'MUBAKA ORBIT OS.lnk'
-$startupLink = Join-Path $startup 'MUBAKA ORBIT OS.lnk'
-$startMenuLink = Join-Path $startMenuDir 'MUBAKA ORBIT OS.lnk'
+$logsRoot = Join-Path $root 'logs'
+$manifestPath = Join-Path $root 'INTEGRITY_MANIFEST.json'
+$verifierPath = Join-Path $root 'VERIFY_MUBAKA_APPLIANCE.ps1'
+$restorePath = Join-Path $travelRoot 'RESTORE_MUBAKA_ORBIT.ps1'
 
 $statePath = Join-Path $dataRoot 'state.json'
 $modulesPath = Join-Path $dataRoot 'modules.json'
 $queuePath = Join-Path $dataRoot 'queue.ndjson'
 $ledgerPath = Join-Path $dataRoot 'ledger.ndjson'
 $auditPath = Join-Path $dataRoot 'audit.ndjson'
-$manifestPath = Join-Path $root 'INTEGRITY_MANIFEST.json'
-$hostUiPath = Join-Path $uiRoot 'os.html'
-$verifierPath = Join-Path $root 'VERIFY_MUBAKA_APPLIANCE.ps1'
-$restorePath = Join-Path $travelRoot 'RESTORE_MUBAKA_ORBIT.ps1'
+$uiPath = Join-Path $root 'ui\os.html'
 
 $appSrc = Join-Path $srcRoot 'MUBAKA_ORBIT_APP.cs'
 $hostSrc = Join-Path $srcRoot 'MUBAKA_ORBIT_HOST.cs'
@@ -40,61 +121,73 @@ $hostExe = Join-Path $binRoot 'MUBAKA_ORBIT_HOST.exe'
 $guardianExe = Join-Path $binRoot 'MUBAKA_ORBIT_GUARDIAN.exe'
 $serviceExe = Join-Path $binRoot 'MUBAKA_ORBIT_CORE_SERVICE.exe'
 
-$finalReceiptPath = Join-Path $root 'FINAL_RECEIPT.json'
+$desktop = [Environment]::GetFolderPath('Desktop')
+$programs = [Environment]::GetFolderPath('Programs')
+$startup = [Environment]::GetFolderPath('Startup')
+$startMenuDir = Join-Path $programs 'MUBAKA ORBIT OS'
+New-Item -ItemType Directory -Path $startMenuDir -Force | Out-Null
+$desktopRealExe = Join-Path $desktop 'MUBAKA ORBIT OS.exe'
+$desktopConvenienceExe = Join-Path $desktop 'MUBAKA ORBIT OS Launcher.exe'
+$startMenuExe = Join-Path $startMenuDir 'MUBAKA ORBIT OS.exe'
+$startupExe = Join-Path $startup 'MUBAKA ORBIT OS.exe'
 
-foreach($dir in @($root,$sealRoot,$backupRoot,$travelRoot,$logsRoot,$dataRoot,$uiRoot,$srcRoot,$binRoot,$startMenuDir)) {
-  New-Item -ItemType Directory -Path $dir -Force | Out-Null
+foreach ($wrapper in @('MUBAKA_ORBIT_APP.vbs','MUBAKA_ORBIT_APP.cmd','MUBAKA_ORBIT_APP_LAUNCHER.ps1')) {
+  $candidate = Join-Path $root $wrapper
+  if (Test-Path -LiteralPath $candidate) {
+    Remove-Item -LiteralPath $candidate -Force
+    $evidence["wrapper_$wrapper"] = 'removed'
+  } else {
+    $evidence["wrapper_$wrapper"] = 'not_present'
+  }
 }
 
-$wrapperRemoval = [ordered]@{}
-foreach($bad in @('MUBAKA_ORBIT_APP.vbs','MUBAKA_ORBIT_APP.cmd','MUBAKA_ORBIT_APP_LAUNCHER.ps1')) {
-  $candidate = Join-Path $root $bad
-  if (Test-Path $candidate) {
-    Remove-Item -LiteralPath $candidate -Force
-    $wrapperRemoval[$bad] = 'removed'
-  } else {
-    $wrapperRemoval[$bad] = 'not_present'
-  }
+$state = [ordered]@{
+  system = 'MUBAKA ORBIT OS'
+  version = '2.0.0'
+  realm = 'inside+outside'
+  mode = 'localhost-only'
+  operating_posture = 'founder-governed closed cadence'
+}
+$state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statePath -Encoding UTF8
+Assert-Path -Path $statePath -Reason 'state.json generation failed' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
+
+$modules = [ordered]@{
+  modules = @(
+    [ordered]@{name='MUBAKA_ORBIT_APP';status='active';purpose='Native app opener';launch_path=$appExe;verify_path='app_open.log';restore_path=(Join-Path $backupRoot 'MUBAKA_ORBIT_APP.exe')},
+    [ordered]@{name='MUBAKA_ORBIT_HOST';status='active';purpose='Localhost host';launch_path=$hostExe;verify_path='http://127.0.0.1:48721/api/health';restore_path=(Join-Path $backupRoot 'MUBAKA_ORBIT_HOST.exe')},
+    [ordered]@{name='MUBAKA_ORBIT_GUARDIAN';status='active';purpose='Health and restore guardian';launch_path=$guardianExe;verify_path='native_guardian.log';restore_path=(Join-Path $backupRoot 'MUBAKA_ORBIT_GUARDIAN.exe')},
+    [ordered]@{name='MUBAKA_ORBIT_CORE_SERVICE';status='active';purpose='Service-grade core loop';launch_path=$serviceExe;verify_path='sc.exe query';restore_path=(Join-Path $backupRoot 'MUBAKA_ORBIT_CORE_SERVICE.exe')}
+  )
+}
+$modules | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $modulesPath -Encoding UTF8
+Assert-Path -Path $modulesPath -Reason 'modules.json generation failed' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
+
+foreach ($stream in @($queuePath,$ledgerPath,$auditPath)) {
+  if (-not (Test-Path -LiteralPath $stream)) { New-Item -ItemType File -Path $stream -Force | Out-Null }
+  Assert-Path -Path $stream -Reason 'stream file creation failed' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
 }
 
 @'
 <!doctype html>
-<html>
-<head><meta charset="utf-8"><title>MUBAKA ORBIT OS</title><style>body{font-family:Segoe UI;background:#050914;color:#f5b735;padding:20px}.ok{color:#4bff95}</style></head>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MUBAKA ORBIT OS</title>
+<style>
+body{background:#080b16;color:#d8e3ff;font-family:Segoe UI;padding:2rem}
+.eye{font-size:2rem;color:#7aff66}
+.panel{border:1px solid #6d78a8;border-radius:12px;padding:1rem;margin-bottom:1rem;background:#12182d}
+</style>
+</head>
 <body>
-<h1>MUBAKA ORBIT OS</h1>
-<p>Native local operating appliance surface.</p>
-<ul>
-  <li class="ok">Inside realm: app, host, guardian, service, ledger, queue, audit</li>
-  <li class="ok">Outside realm: seal backup, travel capsule, restore body, integrity manifest</li>
-</ul>
+<div class="panel"><div class="eye">O-O MUBAKA • green 1</div><div>ORBIS guidance and founder cadence are active.</div></div>
+<div class="panel">Phone truth and website truth share one public posture.</div>
+<div class="panel">Private control room mechanics are excluded from public surface.</div>
 </body>
 </html>
-'@ | Set-Content -LiteralPath $hostUiPath -Encoding UTF8
-
-$state = [ordered]@{
-  system = 'MUBAKA ORBIT OS'
-  version = '1.0.0'
-  realm = 'inside+outside'
-  mode = 'localhost-only'
-  posture = 'forward-only'
-  identity = 'MUBAKA NATIVE EXISTENCE ARCHITECTURE'
-}
-$state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $statePath -Encoding UTF8
-
-$modules = [ordered]@{
-  modules = @(
-    [ordered]@{name='MUBAKA_ORBIT_APP';status='active';purpose='Native app opener';launch_path=$appExe;verify_path='/api/health';restore_path=(Join-Path $backupRoot 'MUBAKA_ORBIT_APP.exe')},
-    [ordered]@{name='MUBAKA_ORBIT_HOST';status='active';purpose='Localhost host';launch_path=$hostExe;verify_path='http://127.0.0.1:48721/api/health';restore_path=(Join-Path $backupRoot 'MUBAKA_ORBIT_HOST.exe')},
-    [ordered]@{name='MUBAKA_ORBIT_GUARDIAN';status='active';purpose='Restore and health guardian';launch_path=$guardianExe;verify_path=(Join-Path $logsRoot 'native_guardian.log');restore_path=(Join-Path $backupRoot 'MUBAKA_ORBIT_GUARDIAN.exe')},
-    [ordered]@{name='MUBAKA_ORBIT_CORE_SERVICE';status='active';purpose='Service-grade supervisor';launch_path=$serviceExe;verify_path='SC QUERY MUBAKA_ORBIT_CORE_SERVICE';restore_path=(Join-Path $backupRoot 'MUBAKA_ORBIT_CORE_SERVICE.exe')}
-  )
-}
-$modules | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $modulesPath -Encoding UTF8
-
-foreach($f in @($queuePath,$ledgerPath,$auditPath)) {
-  if (!(Test-Path $f)) { New-Item -ItemType File -Path $f -Force | Out-Null }
-}
+'@ | Set-Content -LiteralPath $uiPath -Encoding UTF8
+Assert-Path -Path $uiPath -Reason 'UI generation failed' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
 
 $appCode = @"
 using System;
@@ -108,7 +201,7 @@ class Program {
     string guardian = Path.Combine(root, "bin", "MUBAKA_ORBIT_GUARDIAN.exe");
     string url = "http://127.0.0.1:48721/os";
     Directory.CreateDirectory(Path.Combine(root, "logs"));
-    File.AppendAllText(log, "[" + DateTime.UtcNow.ToString("o") + "] app_open\\r\\n");
+    File.AppendAllText(log, "[" + DateTime.UtcNow.ToString("o") + "] app_open\\n");
     if (File.Exists(guardian)) {
       var gp = new ProcessStartInfo(guardian) { UseShellExecute = true, WorkingDirectory = Path.Combine(root, "bin") };
       Process.Start(gp);
@@ -126,72 +219,50 @@ using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-
 class Host {
   static string root = @\"$root\";
   static string log = Path.Combine(root, "logs", "native_host.log");
   static string data = Path.Combine(root, "data");
-
   static void Main() {
     Directory.CreateDirectory(Path.Combine(root, "logs"));
     HttpListener listener = new HttpListener();
     listener.Prefixes.Add("http://127.0.0.1:48721/");
     listener.Start();
     File.AppendAllText(log, "[" + DateTime.UtcNow.ToString("o") + "] host_start\\n");
-    while(true) {
-      var ctx = listener.GetContext();
-      Route(ctx);
-    }
+    while(true) { Route(listener.GetContext()); }
   }
-
   static void Route(HttpListenerContext ctx) {
     string p = ctx.Request.Url.AbsolutePath;
-    if (p == "/os") { ServeFile(ctx, Path.Combine(root, "ui", "os.html"), "text/html"); return; }
-    if (p == "/api/health") { Json(ctx, new { status = "ok", bind = "127.0.0.1", utc = DateTime.UtcNow.ToString("o") }); return; }
-    if (p == "/api/modules") { ServeFile(ctx, Path.Combine(data, "modules.json"), "application/json"); return; }
-    if (p == "/api/ledger") { ServeFile(ctx, Path.Combine(data, "ledger.ndjson"), "application/x-ndjson"); return; }
-    if (p == "/api/queue") { ServeFile(ctx, Path.Combine(data, "queue.ndjson"), "application/x-ndjson"); return; }
+    if (p == "/os") { Write(ctx, File.ReadAllText(Path.Combine(root, "ui", "os.html")), "text/html"); return; }
+    if (p == "/api/health") { Write(ctx, "{\"status\":\"ok\",\"bind\":\"127.0.0.1\"}", "application/json"); return; }
+    if (p == "/api/modules") { Write(ctx, File.ReadAllText(Path.Combine(data, "modules.json")), "application/json"); return; }
+    if (p == "/api/ledger") { Write(ctx, File.ReadAllText(Path.Combine(data, "ledger.ndjson")), "application/x-ndjson"); return; }
+    if (p == "/api/queue") { Write(ctx, File.ReadAllText(Path.Combine(data, "queue.ndjson")), "application/x-ndjson"); return; }
     if (p == "/api/proof") {
-      var proof = new {
-        state = File.Exists(Path.Combine(data, "state.json")),
-        modules = File.Exists(Path.Combine(data, "modules.json")),
-        queue = File.Exists(Path.Combine(data, "queue.ndjson")),
-        ledger = File.Exists(Path.Combine(data, "ledger.ndjson"))
-      };
-      Json(ctx, proof);
-      return;
+      string body = JsonSerializer.Serialize(new { state = File.Exists(Path.Combine(data, "state.json")), modules = File.Exists(Path.Combine(data, "modules.json")), queue = File.Exists(Path.Combine(data, "queue.ndjson")), ledger = File.Exists(Path.Combine(data, "ledger.ndjson")) });
+      Write(ctx, body, "application/json"); return;
     }
     if (p == "/api/route") {
-      string body = new StreamReader(ctx.Request.InputStream).ReadToEnd();
-      if (string.IsNullOrWhiteSpace(body)) body = "{}";
-      string receiptId = DateTime.UtcNow.ToString("yyyyMMddHHmmssfff");
-      string eventPayload = "{\"receipt_id\":\"" + receiptId + "\",\"event\":" + body + ",\"utc\":\"" + DateTime.UtcNow.ToString("o") + "\"}";
-      File.AppendAllText(Path.Combine(data, "queue.ndjson"), eventPayload + "\\n");
+      string payload = new StreamReader(ctx.Request.InputStream).ReadToEnd();
+      if (string.IsNullOrWhiteSpace(payload)) payload = "{}";
+      string receipt = DateTime.UtcNow.ToString("yyyyMMddHHmmssfff");
+      string eventLine = "{\"receipt_id\":\"" + receipt + "\",\"event\":" + payload + ",\"utc\":\"" + DateTime.UtcNow.ToString("o") + "\"}";
+      File.AppendAllText(Path.Combine(data, "queue.ndjson"), eventLine + "\\n");
       using var sha = SHA256.Create();
-      string hash = Convert.ToHexString(sha.ComputeHash(Encoding.UTF8.GetBytes(eventPayload)));
-      string ledger = "{\"receipt_id\":\"" + receiptId + "\",\"hash\":\"" + hash + "\",\"utc\":\"" + DateTime.UtcNow.ToString("o") + "\"}";
-      File.AppendAllText(Path.Combine(data, "ledger.ndjson"), ledger + "\\n");
-      Json(ctx, new { receipt_id = receiptId, hash = hash });
+      string hash = Convert.ToHexString(sha.ComputeHash(Encoding.UTF8.GetBytes(eventLine)));
+      string ledgerLine = "{\"receipt_id\":\"" + receipt + "\",\"hash\":\"" + hash + "\",\"utc\":\"" + DateTime.UtcNow.ToString("o") + "\"}";
+      File.AppendAllText(Path.Combine(data, "ledger.ndjson"), ledgerLine + "\\n");
+      Write(ctx, "{\"receipt_id\":\"" + receipt + "\",\"hash\":\"" + hash + "\"}", "application/json");
       return;
     }
     ctx.Response.StatusCode = 404;
     Write(ctx, "not_found", "text/plain");
   }
-
-  static void ServeFile(HttpListenerContext ctx, string path, string type) {
-    if (!File.Exists(path)) { ctx.Response.StatusCode = 404; Write(ctx, "missing", "text/plain"); return; }
-    Write(ctx, File.ReadAllText(path), type);
-  }
-
-  static void Json(HttpListenerContext ctx, object o) {
-    Write(ctx, JsonSerializer.Serialize(o), "application/json");
-  }
-
-  static void Write(HttpListenerContext ctx, string body, string type) {
-    byte[] b = Encoding.UTF8.GetBytes(body);
-    ctx.Response.ContentType = type;
-    ctx.Response.ContentLength64 = b.Length;
-    ctx.Response.OutputStream.Write(b, 0, b.Length);
+  static void Write(HttpListenerContext ctx, string body, string contentType) {
+    var data = Encoding.UTF8.GetBytes(body);
+    ctx.Response.ContentType = contentType;
+    ctx.Response.ContentLength64 = data.Length;
+    ctx.Response.OutputStream.Write(data, 0, data.Length);
     ctx.Response.OutputStream.Close();
   }
 }
@@ -202,39 +273,32 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
-
 class Guardian {
   static string root = @\"$root\";
-  static string bin = Path.Combine(root, "bin");
-  static string backup = Path.Combine(root, "_MUBAKA_SEAL", "backup");
-  static string log = Path.Combine(root, "logs", "native_guardian.log");
-
   static void Main() {
-    Directory.CreateDirectory(Path.Combine(root, "logs"));
-    Directory.CreateDirectory(backup);
-    File.AppendAllText(log, "[" + DateTime.UtcNow.ToString("o") + "] guardian_start\\n");
+    string bin = Path.Combine(root, "bin");
+    string backup = Path.Combine(root, "_MUBAKA_SEAL", "backup");
     string host = Path.Combine(bin, "MUBAKA_ORBIT_HOST.exe");
-    if (!File.Exists(host)) Restore("MUBAKA_ORBIT_HOST.exe");
-    if (!Healthy()) {
-      var p = new ProcessStartInfo(host) { UseShellExecute = true, WorkingDirectory = bin };
-      Process.Start(p);
+    string log = Path.Combine(root, "logs", "native_guardian.log");
+    Directory.CreateDirectory(Path.Combine(root, "logs"));
+    File.AppendAllText(log, "[" + DateTime.UtcNow.ToString("o") + "] guardian_start\\n");
+    if (!File.Exists(host)) {
+      string backupHost = Path.Combine(backup, "MUBAKA_ORBIT_HOST.exe");
+      if (File.Exists(backupHost)) { File.Copy(backupHost, host, true); }
+    }
+    if (!Health()) {
+      var psi = new ProcessStartInfo(host) { UseShellExecute = true, WorkingDirectory = bin };
+      Process.Start(psi);
       File.AppendAllText(log, "[" + DateTime.UtcNow.ToString("o") + "] host_started\\n");
     }
   }
-
-  static bool Healthy() {
+  static bool Health() {
     try {
       var req = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:48721/api/health");
       req.Method = "GET";
       using var resp = (HttpWebResponse)req.GetResponse();
       return resp.StatusCode == HttpStatusCode.OK;
     } catch { return false; }
-  }
-
-  static void Restore(string file) {
-    string src = Path.Combine(backup, file);
-    string dst = Path.Combine(bin, file);
-    if (File.Exists(src)) File.Copy(src, dst, true);
   }
 }
 "@
@@ -244,18 +308,17 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
-
 class ServiceMain {
   static void Main() {
     string root = @\"$root\";
     string guardian = Path.Combine(root, "bin", "MUBAKA_ORBIT_GUARDIAN.exe");
     string log = Path.Combine(root, "logs", "core_service.log");
     Directory.CreateDirectory(Path.Combine(root, "logs"));
-    File.AppendAllText(log, "[" + DateTime.UtcNow.ToString("o") + "] service_loop_start\\n");
     while(true) {
+      File.AppendAllText(log, "[" + DateTime.UtcNow.ToString("o") + "] service_tick\\n");
       if (File.Exists(guardian)) {
-        var p = new ProcessStartInfo(guardian) { UseShellExecute = true, WorkingDirectory = Path.GetDirectoryName(guardian) };
-        Process.Start(p);
+        var psi = new ProcessStartInfo(guardian) { UseShellExecute = true, WorkingDirectory = Path.Combine(root, "bin") };
+        Process.Start(psi);
       }
       Thread.Sleep(30000);
     }
@@ -268,112 +331,96 @@ $hostCode | Set-Content -LiteralPath $hostSrc -Encoding UTF8
 $guardianCode | Set-Content -LiteralPath $guardianSrc -Encoding UTF8
 $serviceCode | Set-Content -LiteralPath $serviceSrc -Encoding UTF8
 
-$candidates = @(
+foreach ($src in @($appSrc,$hostSrc,$guardianSrc,$serviceSrc)) {
+  Assert-Path -Path $src -Reason 'C# source generation failed' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
+}
+
+$cscCandidates = @(
   "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
   "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe"
 )
-$csc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-$compileProof = [ordered]@{}
-if ($csc) {
-  & $csc /nologo /target:winexe /out:$appExe $appSrc | Out-Null
-  & $csc /nologo /target:exe /out:$hostExe $hostSrc | Out-Null
-  & $csc /nologo /target:exe /out:$guardianExe $guardianSrc | Out-Null
-  & $csc /nologo /target:exe /out:$serviceExe $serviceSrc | Out-Null
-  $compileProof.status = 'compiled'
-  $compileProof.compiler = $csc
-} else {
-  $compileProof.status = 'compiler_unavailable'
-  $compileProof.compiler = 'none'
-  "compiler_unavailable" | Set-Content -LiteralPath (Join-Path $root 'COMPILER_PROOF.txt') -Encoding UTF8
+$csc = $cscCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (-not $csc) {
+  Write-BlockedReceipt -Reason 'Compiler missing' -RootPath $root -ReceiptPath $receiptPath -Evidence @{compiler='missing';proof='COMPILER_REQUIRED_FOR_EXE_ARTIFACTS'}
 }
 
-foreach($required in @($appExe,$hostExe,$guardianExe,$serviceExe)) {
-  if (Test-Path $required) {
-    Copy-Item -LiteralPath $required -Destination (Join-Path $backupRoot ([IO.Path]::GetFileName($required))) -Force
-  }
+Invoke-NativeChecked -FilePath $csc -Arguments @('/nologo','/target:winexe',"/out:$appExe",$appSrc) -Label 'compile_app' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
+Assert-Path -Path $appExe -Reason 'App exe missing after compile' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
+Invoke-NativeChecked -FilePath $csc -Arguments @('/nologo','/target:exe',"/out:$hostExe",$hostSrc) -Label 'compile_host' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
+Assert-Path -Path $hostExe -Reason 'Host exe missing after compile' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
+Invoke-NativeChecked -FilePath $csc -Arguments @('/nologo','/target:exe',"/out:$guardianExe",$guardianSrc) -Label 'compile_guardian' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
+Assert-Path -Path $guardianExe -Reason 'Guardian exe missing after compile' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
+Invoke-NativeChecked -FilePath $csc -Arguments @('/nologo','/target:exe',"/out:$serviceExe",$serviceSrc) -Label 'compile_service' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
+Assert-Path -Path $serviceExe -Reason 'Service exe missing after compile' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
+
+foreach ($artifact in @($appExe,$hostExe,$guardianExe,$serviceExe,$uiPath,$statePath,$modulesPath,$queuePath,$ledgerPath,$auditPath)) {
+  Copy-Item -LiteralPath $artifact -Destination (Join-Path $backupRoot ([IO.Path]::GetFileName($artifact))) -Force
+  Assert-Path -Path (Join-Path $backupRoot ([IO.Path]::GetFileName($artifact))) -Reason 'Backup copy failed' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
 }
 
-if (Test-Path $appExe) {
-  Copy-Item -LiteralPath $appExe -Destination $desktopRealExe -Force
-}
-
-$wsh = New-Object -ComObject WScript.Shell
-foreach($lnk in @($desktopLink,$startupLink,$startMenuLink)) {
-  $shortcut = $wsh.CreateShortcut($lnk)
-  $shortcut.TargetPath = $appExe
-  $shortcut.WorkingDirectory = $root
-  $shortcut.Description = 'MUBAKA ORBIT OS'
-  $shortcut.IconLocation = $appExe
-  $shortcut.Save()
-}
-
-$serviceStatus = 'not_installed'
-try {
-  & sc.exe query MUBAKA_ORBIT_CORE_SERVICE *> $null
-  if ($LASTEXITCODE -ne 0) {
-    & sc.exe create MUBAKA_ORBIT_CORE_SERVICE binPath= "`"$serviceExe`"" start= auto | Out-Null
-  }
-  & sc.exe failure MUBAKA_ORBIT_CORE_SERVICE reset= 0 actions= restart/60000/restart/60000/restart/60000 | Out-Null
-  & sc.exe start MUBAKA_ORBIT_CORE_SERVICE | Out-Null
-  $serviceStatus = 'installed_or_running'
-} catch {
-  $serviceStatus = 'install_failed_fallback_active'
-  Add-Content -LiteralPath $auditPath -Value ("{""utc"":""{0}"",""event"":""service_install_failed"",""reason"":""{1}""}" -f [DateTime]::UtcNow.ToString('o'), $_.Exception.Message.Replace('"','\"'))
-}
-
-$taskStatus = [ordered]@{}
-$taskCmd = "`"$guardianExe`""
-foreach($pair in @(
-  @{Name='MUBAKA_ORBIT_GUARDIAN_MINUTE';Args='/SC MINUTE /MO 1 /RL LIMITED /TR ' + $taskCmd},
-  @{Name='MUBAKA_ORBIT_GUARDIAN_STARTUP';Args='/SC ONSTART /RL LIMITED /TR ' + $taskCmd},
-  @{Name='MUBAKA_ORBIT_GUARDIAN_LOGON';Args='/SC ONLOGON /RL LIMITED /TR ' + $taskCmd}
-)) {
-  try {
-    & schtasks.exe /Create /F /TN $pair.Name $pair.Args.Split(' ') | Out-Null
-    $taskStatus[$pair.Name] = 'ok'
-  } catch {
-    $taskStatus[$pair.Name] = 'failed'
-  }
+Copy-Item -LiteralPath $appExe -Destination $desktopRealExe -Force
+Copy-Item -LiteralPath $appExe -Destination $desktopConvenienceExe -Force
+Copy-Item -LiteralPath $appExe -Destination $startMenuExe -Force
+Copy-Item -LiteralPath $appExe -Destination $startupExe -Force
+foreach ($entry in @($desktopRealExe,$desktopConvenienceExe,$startMenuExe,$startupExe)) {
+  Assert-Path -Path $entry -Reason 'Desktop/startup/start menu entry missing' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
 }
 
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 New-Item -Path $runKey -Force | Out-Null
 Set-ItemProperty -Path $runKey -Name 'MUBAKA_ORBIT_APP' -Value ('"' + $appExe + '"')
 Set-ItemProperty -Path $runKey -Name 'MUBAKA_ORBIT_GUARDIAN' -Value ('"' + $guardianExe + '"')
+$runValues = Get-ItemProperty -Path $runKey
+if (-not $runValues.MUBAKA_ORBIT_APP) {
+  Write-BlockedReceipt -Reason 'Run key for app missing' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
+}
+
+$serviceName = 'MUBAKA_ORBIT_CORE_SERVICE'
+Invoke-NativeChecked -FilePath 'sc.exe' -Arguments @('query',$serviceName) -Label 'service_query_initial' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence -AllowFailure
+if ($evidence['service_query_initial'] -ne 'ok') {
+  Invoke-NativeChecked -FilePath 'sc.exe' -Arguments @('create',$serviceName,"binPath= `"$serviceExe`"",'start= auto') -Label 'service_create' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence -AllowFailure
+}
+Invoke-NativeChecked -FilePath 'sc.exe' -Arguments @('failure',$serviceName,'reset= 0','actions= restart/60000/restart/60000/restart/60000') -Label 'service_failure_policy' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence -AllowFailure
+Invoke-NativeChecked -FilePath 'sc.exe' -Arguments @('start',$serviceName) -Label 'service_start' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence -AllowFailure
+Invoke-NativeChecked -FilePath 'sc.exe' -Arguments @('query',$serviceName) -Label 'service_query_final' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence -AllowFailure
+
+foreach ($task in @(
+  @{Name='MUBAKA_ORBIT_GUARDIAN_MINUTE';Schedule=@('/SC','MINUTE','/MO','1')},
+  @{Name='MUBAKA_ORBIT_GUARDIAN_STARTUP';Schedule=@('/SC','ONSTART')},
+  @{Name='MUBAKA_ORBIT_GUARDIAN_LOGON';Schedule=@('/SC','ONLOGON')}
+)) {
+  Invoke-NativeChecked -FilePath 'schtasks.exe' -Arguments @('/Create','/F','/TN',$task.Name) + $task.Schedule + @('/TR',('"' + $guardianExe + '"')) -Label ("task_create_" + $task.Name) -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence -AllowFailure
+  Invoke-NativeChecked -FilePath 'schtasks.exe' -Arguments @('/Query','/TN',$task.Name) -Label ("task_query_" + $task.Name) -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence -AllowFailure
+}
 
 $manifestEntries = @()
-$coreFiles = @($appExe,$hostExe,$guardianExe,$serviceExe,$hostUiPath,$statePath,$modulesPath,$queuePath,$ledgerPath,$auditPath)
-foreach($file in $coreFiles) {
-  if (Test-Path $file) {
-    $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
-    $manifestEntries += [ordered]@{path=$file;sha256=$hash}
-  }
+foreach ($artifact in @($appExe,$hostExe,$guardianExe,$serviceExe,$uiPath,$statePath,$modulesPath,$queuePath,$ledgerPath,$auditPath)) {
+  $manifestEntries += [ordered]@{path=$artifact;sha256=(Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash}
 }
-([ordered]@{generated_utc=[DateTime]::UtcNow.ToString('o');files=$manifestEntries}) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+([ordered]@{generated_utc=[DateTime]::UtcNow.ToString('o');files=$manifestEntries}) | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+Assert-Path -Path $manifestPath -Reason 'Manifest generation failed' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
+Copy-Item -LiteralPath $manifestPath -Destination (Join-Path $backupRoot 'INTEGRITY_MANIFEST.json') -Force
 
-foreach($file in $coreFiles + @($manifestPath,$verifierPath)) {
-  if (Test-Path $file) {
-    Copy-Item -LiteralPath $file -Destination (Join-Path $backupRoot ([IO.Path]::GetFileName($file))) -Force
-  }
-}
-
-$restoreBody = @"
+$restoreContent = @"
 `$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
 `$root='$root'
 `$backup=Join-Path `$root '_MUBAKA_SEAL\\backup'
 `$bin=Join-Path `$root 'bin'
 `$ui=Join-Path `$root 'ui'
 `$data=Join-Path `$root 'data'
 foreach(`$d in @(`$root,`$bin,`$ui,`$data)){New-Item -ItemType Directory -Path `$d -Force|Out-Null}
-foreach(`$f in @('MUBAKA_ORBIT_APP.exe','MUBAKA_ORBIT_HOST.exe','MUBAKA_ORBIT_GUARDIAN.exe','MUBAKA_ORBIT_CORE_SERVICE.exe')){if(Test-Path (Join-Path `$backup `$f)){Copy-Item (Join-Path `$backup `$f) (Join-Path `$bin `$f) -Force}}
-foreach(`$f in @('os.html')){if(Test-Path (Join-Path `$backup `$f)){Copy-Item (Join-Path `$backup `$f) (Join-Path `$ui `$f) -Force}}
-foreach(`$f in @('state.json','modules.json','queue.ndjson','ledger.ndjson','audit.ndjson')){if(Test-Path (Join-Path `$backup `$f)){Copy-Item (Join-Path `$backup `$f) (Join-Path `$data `$f) -Force}}
-Write-Host 'RESTORE_COMPLETE'
+foreach(`$f in @('MUBAKA_ORBIT_APP.exe','MUBAKA_ORBIT_HOST.exe','MUBAKA_ORBIT_GUARDIAN.exe','MUBAKA_ORBIT_CORE_SERVICE.exe')){Copy-Item -LiteralPath (Join-Path `$backup `$f) -Destination (Join-Path `$bin `$f) -Force}
+Copy-Item -LiteralPath (Join-Path `$backup 'os.html') -Destination (Join-Path `$ui 'os.html') -Force
+foreach(`$f in @('state.json','modules.json','queue.ndjson','ledger.ndjson','audit.ndjson')){Copy-Item -LiteralPath (Join-Path `$backup `$f) -Destination (Join-Path `$data `$f) -Force}
+Write-Output 'RESTORE_CONFIRMED'
 "@
-$restoreBody | Set-Content -LiteralPath $restorePath -Encoding UTF8
+$restoreContent | Set-Content -LiteralPath $restorePath -Encoding UTF8
+Assert-Path -Path $restorePath -Reason 'Restore script generation failed' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
 
-$verifyBody = @"
+$verifyContent = @"
 `$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
 `$root='$root'
 `$checks=[ordered]@{}
 `$checks.app_exe=Test-Path (Join-Path `$root 'bin\\MUBAKA_ORBIT_APP.exe')
@@ -387,60 +434,64 @@ $verifyBody = @"
 `$checks.audit=Test-Path (Join-Path `$root 'data\\audit.ndjson')
 `$checks.manifest=Test-Path (Join-Path `$root 'INTEGRITY_MANIFEST.json')
 `$checks.sealed_backup=Test-Path (Join-Path `$root '_MUBAKA_SEAL\\backup')
-`$checks.travel=Test-Path (Join-Path `$root '_TRAVEL')
+`$checks.travel_capsule=Test-Path (Join-Path `$root '_TRAVEL')
 `$checks.desktop_real_exe=Test-Path (Join-Path ([Environment]::GetFolderPath('Desktop')) 'MUBAKA ORBIT OS.exe')
-`$checks.start_menu=Test-Path (Join-Path ([Environment]::GetFolderPath('Programs')) 'MUBAKA ORBIT OS\\MUBAKA ORBIT OS.lnk')
-`$checks.startup=Test-Path (Join-Path ([Environment]::GetFolderPath('Startup')) 'MUBAKA ORBIT OS.lnk')
+`$checks.start_menu_exe=Test-Path (Join-Path ([Environment]::GetFolderPath('Programs')) 'MUBAKA ORBIT OS\\MUBAKA ORBIT OS.exe')
+`$checks.startup_exe=Test-Path (Join-Path ([Environment]::GetFolderPath('Startup')) 'MUBAKA ORBIT OS.exe')
 `$checks.run_key=((Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -ErrorAction SilentlyContinue).MUBAKA_ORBIT_APP -ne `$null)
-try { `$health = Invoke-RestMethod -Uri 'http://127.0.0.1:48721/api/health' -Method GET -TimeoutSec 2; `$checks.localhost_health = (`$health.status -eq 'ok') } catch { `$checks.localhost_health = `$false }
-`$checks | ConvertTo-Json -Depth 4 | Write-Output
+foreach(`$bad in @('MUBAKA_ORBIT_APP.vbs','MUBAKA_ORBIT_APP.cmd','MUBAKA_ORBIT_APP_LAUNCHER.ps1')){`$checks[`$bad]= -not (Test-Path (Join-Path `$root `$bad))}
+try { `$h = Invoke-RestMethod -Uri 'http://127.0.0.1:48721/api/health' -Method GET -TimeoutSec 2; `$checks.localhost_health = (`$h.status -eq 'ok') } catch { `$checks.localhost_health = `$false }
+`$checks | ConvertTo-Json -Depth 10 | Write-Output
 "@
-$verifyBody | Set-Content -LiteralPath $verifierPath -Encoding UTF8
+$verifyContent | Set-Content -LiteralPath $verifierPath -Encoding UTF8
+Assert-Path -Path $verifierPath -Reason 'Verifier generation failed' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
 
-$travelStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$travelWork = Join-Path $travelRoot 'capsule_payload'
-if (Test-Path $travelWork) { Remove-Item -LiteralPath $travelWork -Recurse -Force }
-New-Item -ItemType Directory -Path $travelWork -Force | Out-Null
-foreach($item in @($binRoot,$uiRoot,$dataRoot,$manifestPath,$restorePath,$verifierPath)) {
-  if (Test-Path $item) {
-    Copy-Item -LiteralPath $item -Destination $travelWork -Recurse -Force
-  }
+$travelPayload = Join-Path $travelRoot 'capsule_payload'
+if (Test-Path -LiteralPath $travelPayload) { Remove-Item -LiteralPath $travelPayload -Recurse -Force }
+New-Item -ItemType Directory -Path $travelPayload -Force | Out-Null
+foreach ($item in @($binRoot,(Join-Path $root 'ui'),$dataRoot,$manifestPath,$restorePath,$verifierPath)) {
+  Copy-Item -LiteralPath $item -Destination $travelPayload -Recurse -Force
 }
-$travelZip = Join-Path $travelRoot ("MUBAKA_ORBIT_OS_TRAVEL_CAPSULE_{0}.zip" -f $travelStamp)
-Compress-Archive -Path (Join-Path $travelWork '*') -DestinationPath $travelZip -Force
+$travelZip = Join-Path $travelRoot ('MUBAKA_ORBIT_OS_TRAVEL_CAPSULE_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.zip')
+Compress-Archive -Path (Join-Path $travelPayload '*') -DestinationPath $travelZip -Force
+Assert-Path -Path $travelZip -Reason 'Travel capsule generation failed' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
 
-$healthStatus = 'down'
-if (Test-Path $guardianExe) {
-  $p = New-Object System.Diagnostics.ProcessStartInfo
-  $p.FileName = $guardianExe
-  $p.WorkingDirectory = $binRoot
-  $p.UseShellExecute = $true
-  [System.Diagnostics.Process]::Start($p) | Out-Null
-  Start-Sleep -Seconds 2
-}
+$guardianProcess = New-Object System.Diagnostics.ProcessStartInfo
+$guardianProcess.FileName = $guardianExe
+$guardianProcess.WorkingDirectory = $binRoot
+$guardianProcess.UseShellExecute = $true
+[System.Diagnostics.Process]::Start($guardianProcess) | Out-Null
+
+Start-Sleep -Seconds 2
+$health = 'down'
 try {
-  $health = Invoke-RestMethod -Method GET -Uri 'http://127.0.0.1:48721/api/health' -TimeoutSec 2
-  if ($health.status -eq 'ok') { $healthStatus = 'ok' }
-} catch { $healthStatus = 'down' }
-
-if (Test-Path $appExe) {
-  $open = New-Object System.Diagnostics.ProcessStartInfo
-  $open.FileName = $appExe
-  $open.WorkingDirectory = $binRoot
-  $open.UseShellExecute = $true
-  [System.Diagnostics.Process]::Start($open) | Out-Null
+  $h = Invoke-RestMethod -Uri 'http://127.0.0.1:48721/api/health' -Method GET -TimeoutSec 2
+  if ($h.status -eq 'ok') { $health = 'ok' }
+} catch {
+  $health = 'down'
+}
+if ($health -ne 'ok') {
+  Write-BlockedReceipt -Reason 'Host health verification failed' -RootPath $root -ReceiptPath $receiptPath -Evidence $evidence
 }
 
-$verifyOpen = New-Object System.Diagnostics.ProcessStartInfo
-$verifyOpen.FileName = Join-Path $PSHOME 'powershell.exe'
-$verifyOpen.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $verifierPath + '"'
-$verifyOpen.UseShellExecute = $true
-[System.Diagnostics.Process]::Start($verifyOpen) | Out-Null
+$appProcess = New-Object System.Diagnostics.ProcessStartInfo
+$appProcess.FileName = $appExe
+$appProcess.WorkingDirectory = $binRoot
+$appProcess.UseShellExecute = $true
+[System.Diagnostics.Process]::Start($appProcess) | Out-Null
+
+$verifyProcess = New-Object System.Diagnostics.ProcessStartInfo
+$verifyProcess.FileName = Join-Path $PSHOME 'powershell.exe'
+$verifyProcess.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $verifierPath + '"'
+$verifyProcess.UseShellExecute = $true
+[System.Diagnostics.Process]::Start($verifyProcess) | Out-Null
 
 $hashMap = [ordered]@{}
-foreach($file in @($appExe,$hostExe,$guardianExe,$serviceExe,$manifestPath,$travelZip)) {
-  if (Test-Path $file) { $hashMap[$file] = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash }
+foreach ($artifact in @($appExe,$hostExe,$guardianExe,$serviceExe,$manifestPath,$travelZip)) {
+  $hashMap[$artifact] = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash
 }
+
+$serviceStatus = if ($evidence['service_query_final'] -eq 'ok') { 'verified' } else { 'fallback_without_service_verification' }
 
 $receipt = [ordered]@{
   root_path = $root
@@ -449,18 +500,19 @@ $receipt = [ordered]@{
   guardian_exe_path = $guardianExe
   service_exe_path = $serviceExe
   desktop_real_exe_path = $desktopRealExe
-  start_menu_path = $startMenuLink
-  startup_path = $startupLink
+  start_menu_path = $startMenuExe
+  startup_path = $startupExe
   travel_capsule_path = $travelZip
   manifest_path = $manifestPath
   verifier_path = $verifierPath
   service_status = $serviceStatus
-  health_status = $healthStatus
-  wrapper_removal_status = $wrapperRemoval
+  health_status = $health
+  wrapper_removal_status = $evidence.Keys | Where-Object { $_ -like 'wrapper_*' } | ForEach-Object { [ordered]@{name=$_;status=$evidence[$_]} }
   sha256_hashes = $hashMap
+  command_evidence = $evidence
   final_impossible_statement = 'Impossible to prevent disk wipe, administrator deletion, OS reset, malware compromise, or policy removal.'
+  next_action = 'Review FINAL_RECEIPT.json and run verifier for confirmation cadence.'
 }
-$receipt | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $finalReceiptPath -Encoding UTF8
+$receipt | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath $receiptPath -Encoding UTF8
 
-Write-Output 'MUBAKA_ORBIT_OS_BUILD_COMPLETE'
-Write-Output (Get-Content -LiteralPath $finalReceiptPath -Raw)
+Write-Output (Get-Content -LiteralPath $receiptPath -Raw)

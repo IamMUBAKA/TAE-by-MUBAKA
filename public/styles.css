@@ -1,0 +1,4 @@
+:root { color-scheme: dark; }
+body { margin: 0; font-family: Segoe UI, Arial, sans-serif; background: #0a0d18; color: #dce5ff; }
+.shell { max-width: 760px; margin: 4rem auto; padding: 2rem; border: 1px solid #4f5a84; border-radius: 14px; background: #141a2f; }
+.eye { color: #76ff66; font-weight: 700; }
